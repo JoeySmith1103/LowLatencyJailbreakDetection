@@ -1,10 +1,10 @@
-FROM python:3.10-slim
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 WORKDIR /app
 
 # Install system dependencies
 ENV PYTHONUNBUFFERED=1
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
@@ -17,11 +17,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # --- BAKE MODEL INTO IMAGE ---
 # Copy download script separately to leverage caching
 COPY src/download_model.py .
-# Use Docker BuildKit secrets to securely pass the HF token during build.
-# This keeps the image clean and avoids security warnings.
+# Optionally download the model during build.
+# If you pass a BuildKit secret named HF_TOKEN, the model will be cached in the image.
+# Otherwise the image will still build, and the model can be downloaded at runtime (requires env HF_TOKEN).
 RUN --mount=type=secret,id=HF_TOKEN \
-    export HF_TOKEN=$(cat /run/secrets/HF_TOKEN) && \
-    python3 download_model.py
+    bash -lc 'if [ -f /run/secrets/HF_TOKEN ]; then export HF_TOKEN="$(cat /run/secrets/HF_TOKEN)"; python3 download_model.py; else echo "HF_TOKEN secret not provided; skipping model download at build time."; fi'
 # -----------------------------
 # -----------------------------
 

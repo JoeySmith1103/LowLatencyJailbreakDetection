@@ -1,3 +1,4 @@
+import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import time
@@ -10,14 +11,38 @@ class LlamaGuardService:
             cls._instance = super(LlamaGuardService, cls).__new__(cls)
             cls._instance.model_id = "meta-llama/Llama-Guard-3-1B"
             cls._instance.device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+            
+            # Get Hugging Face token from environment variables
+            # Support both HF_TOKEN and HUGGING_FACE_HUB_TOKEN
+            hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+            if not hf_token:
+                raise ValueError(
+                    "Hugging Face token not found! Please set HF_TOKEN or HUGGING_FACE_HUB_TOKEN "
+                    "in your .env file or environment variables."
+                )
+            
             print(f"Loading model {cls._instance.model_id} on {cls._instance.device}...")
             
-            cls._instance.tokenizer = AutoTokenizer.from_pretrained(cls._instance.model_id)
-            cls._instance.model = AutoModelForCausalLM.from_pretrained(
+            cls._instance.tokenizer = AutoTokenizer.from_pretrained(
                 cls._instance.model_id,
-                torch_dtype=torch.bfloat16 if cls._instance.device != "cpu" else torch.float32,
-                device_map=cls._instance.device
+                token=hf_token
             )
+
+            # For GPU, prefer device_map="auto" so HF dispatches weights onto CUDA.
+            # For CPU/MPS, load normally and move to the selected device.
+            if cls._instance.device == "cuda":
+                cls._instance.model = AutoModelForCausalLM.from_pretrained(
+                    cls._instance.model_id,
+                    token=hf_token,
+                    torch_dtype=torch.float16,
+                    device_map="auto",
+                )
+            else:
+                cls._instance.model = AutoModelForCausalLM.from_pretrained(
+                    cls._instance.model_id,
+                    token=hf_token,
+                    torch_dtype=torch.float32,
+                ).to(cls._instance.device)
             print("Model loaded successfully.")
         return cls._instance
 
