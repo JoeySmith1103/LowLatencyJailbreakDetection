@@ -14,25 +14,20 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- BAKE MODEL INTO IMAGE ---
-# Copy download script separately to leverage caching
-COPY src/download_model.py .
-# Optionally download the model during build.
-# If you pass a BuildKit secret named HF_TOKEN, the model will be cached in the image.
-# Otherwise the image will still build, and the model can be downloaded at runtime (requires env HF_TOKEN).
-RUN --mount=type=secret,id=HF_TOKEN \
-    bash -lc 'if [ -f /run/secrets/HF_TOKEN ]; then export HF_TOKEN="$(cat /run/secrets/HF_TOKEN)"; python3 download_model.py; else echo "HF_TOKEN secret not provided; skipping model download at build time."; fi'
-# -----------------------------
-# -----------------------------
-
-# Copy source code (this changes frequently, so keep it late)
+# Copy source code
 COPY src /app/src
 
+# Copy evaluate scripts and test data
+COPY evaluate.py /app/evaluate.py
+COPY evaluate_cache.py /app/evaluate_cache.py
+COPY LLMSafetyAPIService_data.json /app/LLMSafetyAPIService_data.json
+
 # Expose port
-EXPOSE 8000
+EXPOSE 8001
 
 # Set environment variables
 ENV PYTHONPATH=/app
 
 # Command to run the application
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8001"]
+
