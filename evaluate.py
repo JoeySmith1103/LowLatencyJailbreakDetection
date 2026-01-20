@@ -14,6 +14,14 @@ def evaluate(api_url: str, data_path: str):
     correct_count = 0
     total_count = len(data)
     
+    # Warmup request to exclude cold start from metrics
+    print("Warming up model...")
+    try:
+        requests.post(f"{api_url}/v1/detect", json={"text": "warmup"})
+    except Exception:
+        pass
+    print("Warmup done.")
+    
     print(f"Starting evaluation on {total_count} items...")
     
     for i, item in enumerate(data):
@@ -54,8 +62,8 @@ def evaluate(api_url: str, data_path: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", default="http://localhost:8000", help="API URL")
-    parser.add_argument("--data", default="LLMSafetyAPIService_data.json", help="Path to test data")
+    parser.add_argument("--url", default="http://localhost:8001", help="API URL")
+    parser.add_argument("--data", default="/app/LLMSafetyAPIService_data.json", help="Path to test data")
     args = parser.parse_args()
     
     evaluate(args.url, args.data)
