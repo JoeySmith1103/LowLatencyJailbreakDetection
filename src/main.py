@@ -19,12 +19,13 @@ class DetectRequest(BaseModel):
 
 class DetectResponse(BaseModel):
     label: str
+    layer: str  # "cache", "embedding", or "llm"
 
 @app.post("/v1/detect", response_model=DetectResponse)
 async def detect(request: DetectRequest):
     try:
-        label = service.predict(request.text)
-        return DetectResponse(label=label)
+        label, layer = service.predict(request.text)
+        return DetectResponse(label=label, layer=layer)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
