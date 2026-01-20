@@ -1,6 +1,10 @@
 import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 def download_model():
     model_id = "meta-llama/Llama-Guard-3-1B"
@@ -8,7 +12,7 @@ def download_model():
     
     # Get Hugging Face token from environment variables
     # Support both HF_TOKEN and HUGGING_FACE_HUB_TOKEN
-    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    hf_token = os.getenv("HF_TOKEN")
     if not hf_token:
         raise ValueError(
             "Hugging Face token not found! Please set HF_TOKEN or HUGGING_FACE_HUB_TOKEN "
