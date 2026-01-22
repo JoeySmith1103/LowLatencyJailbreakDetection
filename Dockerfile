@@ -17,10 +17,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY src /app/src
 
-# Copy evaluate scripts and test data
-COPY evaluate.py /app/evaluate.py
-COPY evaluate_cache.py /app/evaluate_cache.py
+# Copy experiment scripts and test data
+COPY analyze_threshold.py /app/analyze_threshold.py
+COPY run_ablation_study.py /app/run_ablation_study.py
 COPY LLMSafetyAPIService_data.json /app/LLMSafetyAPIService_data.json
+
+# Pre-download model during build
+ARG HF_TOKEN
+RUN test -n "$HF_TOKEN" || (echo "ERROR: HF_TOKEN build arg is required" && exit 1)
+ENV HF_TOKEN=${HF_TOKEN}
+RUN python3 /app/src/download_model.py
 
 # Expose port
 EXPOSE 8001
