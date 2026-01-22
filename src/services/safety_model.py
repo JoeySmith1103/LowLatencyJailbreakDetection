@@ -2,17 +2,24 @@ import os
 import torch
 import hashlib
 import numpy as np
+from collections import OrderedDict
 from transformers import AutoTokenizer, AutoModelForCausalLM, StoppingCriteria, StoppingCriteriaList
 from sentence_transformers import SentenceTransformer
 from src.services.unsafe_examples import UNSAFE_CATEGORIES, get_all_category_texts
 
 
 # ============================================================
-# Layer 3 Helper: Custom Stopping Criteria
+# Custom Stopping Criteria
 # Stop generation immediately when "safe" or "unsafe" is detected
 # ============================================================
 class SafetyStoppingCriteria(StoppingCriteria):
-    """Custom stopping criteria that stops when 'safe' or 'unsafe' token is generated."""
+    """
+    Custom stopping criteria that stops when 'safe' or 'unsafe' token is generated.
+    
+    Why this works:
+    - LLaMA Guard outputs "safe" or "unsafe" as the FIRST token
+    - No need to wait for full generation (which might include category info like "unsafe\nS1")
+    """
     
     def __init__(self, tokenizer, stop_tokens=None):
         self.tokenizer = tokenizer
@@ -33,6 +40,20 @@ class SafetyStoppingCriteria(StoppingCriteria):
 
 
 class LlamaGuardService:
+    """
+    Two-Layer Jailbreak Detection Service.
+    
+    Optimization Modes (via OPTIMIZATION_MODE env var):
+    - baseline: Pure LLaMA Guard, no optimizations
+    - stopping: LLaMA Guard with custom stopping criteria only
+    - embedding: Embedding fast path only
+    - full: Stopping + Embedding (recommended)
+    
+    Trade-off Control (via EMBEDDING_THRESHOLD env var):
+    - Lower threshold (e.g., 0.50): More aggressive blocking, lower latency, but may have false positives
+    - Higher threshold (e.g., 0.85): More conservative, higher latency, but more accurate
+    - Default: 0.60 (balanced)
+    """
     _instance = None
 
     def __new__(cls):
@@ -46,29 +67,39 @@ class LlamaGuardService:
         self.device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         
         # ============================================================
-        # Optimization Mode: "baseline" or "optimized"
-        # Set via environment variable OPTIMIZATION_MODE
+        # Optimization Mode Configuration
+        # Modes for Ablation Study:
+        # - baseline: Pure LLaMA Guard, no optimizations
+        # - stopping: LLaMA Guard with stopping criteria only
+        # - embedding: Embedding fast path only (no stopping criteria)
+        # - full: Stopping + Embedding (recommended)
         # ============================================================
-        self._optimization_mode = os.getenv("OPTIMIZATION_MODE", "optimized").lower()
+        self._optimization_mode = os.getenv("OPTIMIZATION_MODE", "full").lower()
+        valid_modes = ["baseline", "stopping", "embedding", "full"]
+        if self._optimization_mode not in valid_modes:
+            print(f"Warning: Invalid mode '{self._optimization_mode}', using 'full'")
+            self._optimization_mode = "full"
+        
         print(f"Running in {self._optimization_mode.upper()} mode")
         
-        # ============================================================
-        # Layer 1: Exact Match Cache (only in optimized mode)
-        # ============================================================
-        self._cache = {}
-        self._cache_max_size = 10 if self._optimization_mode == "optimized" else 0
+        # Determine which features are enabled
+        self._use_stopping_criteria = self._optimization_mode in ["stopping", "full"]
+        self._use_embedding_layer = self._optimization_mode in ["embedding", "full"]
+        
+        print(f"  - Stopping Criteria: {'ON' if self._use_stopping_criteria else 'OFF'}")
+        print(f"  - Embedding Layer:   {'ON' if self._use_embedding_layer else 'OFF'}")
         
         # ============================================================
-        # Layer 2: Embedding Similarity Configuration (only in optimized mode)
+        # Embedding Threshold Configuration
         # ============================================================
-        self._embedding_threshold = 0.70
-        self._use_embedding_layer = (self._optimization_mode == "optimized")
+        self._embedding_threshold = float(os.getenv("EMBEDDING_THRESHOLD", "0.60"))
+        print(f"  - Embedding Threshold: {self._embedding_threshold}")
         
         # Get Hugging Face token
-        hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+        hf_token = os.getenv("HF_TOKEN")
         if not hf_token:
             raise ValueError(
-                "Hugging Face token not found! Please set HF_TOKEN or HUGGING_FACE_HUB_TOKEN "
+                "Hugging Face token not found! Please set HF_TOKEN"
                 "in your .env file or environment variables."
             )
         
@@ -76,7 +107,6 @@ class LlamaGuardService:
         print(f"Loading LLaMA Guard on {self.device}...")
         self._load_llama_guard(hf_token)
         
-        # Only load embedding model in optimized mode
         if self._use_embedding_layer:
             print("Loading embedding model...")
             self._load_embedding_model()
@@ -84,15 +114,19 @@ class LlamaGuardService:
         print("All models loaded successfully.")
     
     def _load_llama_guard(self, hf_token):
-        """Load Layer 3: LLaMA Guard model."""
+        """Load LLaMA Guard model."""
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_id,
             token=hf_token
         )
         
-        self.stopping_criteria = StoppingCriteriaList([
-            SafetyStoppingCriteria(self.tokenizer)
-        ])
+        # Only create stopping criteria if enabled
+        if self._use_stopping_criteria:
+            self.stopping_criteria = StoppingCriteriaList([
+                SafetyStoppingCriteria(self.tokenizer)
+            ])
+        else:
+            self.stopping_criteria = None
 
         if self.device == "cuda":
             self.model = AutoModelForCausalLM.from_pretrained(
@@ -109,46 +143,58 @@ class LlamaGuardService:
             ).to(self.device)
     
     def _load_embedding_model(self):
-        """Load Layer 2: Embedding model and pre-compute category embeddings."""
-        # Use a small, fast embedding model
+        """
+        Load embedding model and pre-compute category embeddings.
+        
+        Model Choice: all-MiniLM-L6-v2
+        - Lightweight: 384 dimensions, 22M parameters
+        - Fast: ~2.8ms per query on GPU
+        - Good quality: Trained on 1B sentence pairs
+        """
         self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         
-        # Pre-compute embeddings for all unsafe category texts
+        # Pre-compute embeddings for all unsafe categories
         category_texts = get_all_category_texts()
         self._category_ids = [cat_id for cat_id, _ in category_texts]
-        texts = [text for _, text in category_texts]
+        self._category_texts = [text for _, text in category_texts]
         
-        # Compute embeddings once at startup
-        self._category_embeddings = self.embedding_model.encode(texts, convert_to_numpy=True)
-        print(f"  Pre-computed {len(texts)} category embeddings")
-
-    def _get_cache_key(self, text: str) -> str:
-        """Generate a cache key from text using SHA256 hash."""
-        return hashlib.sha256(text.encode()).hexdigest()
-
-    def _check_embedding_similarity(self, text: str) -> tuple[bool, float]:
-        """
-        Layer 2: Check if text is similar to any known unsafe category.
-        Returns (is_unsafe, max_similarity)
-        """
-        # Encode the query
-        query_embedding = self.embedding_model.encode([text], convert_to_numpy=True)[0]
-        
-        # Compute cosine similarity with all category embeddings
-        similarities = np.dot(self._category_embeddings, query_embedding) / (
-            np.linalg.norm(self._category_embeddings, axis=1) * np.linalg.norm(query_embedding)
+        self._category_embeddings = self.embedding_model.encode(
+            self._category_texts, 
+            convert_to_numpy=True,
+            normalize_embeddings=True  # Normalize for cosine similarity
         )
-        
-        max_similarity = float(np.max(similarities))
-        
-        # If similarity exceeds threshold, classify as unsafe
-        if max_similarity >= self._embedding_threshold:
-            return True, max_similarity
-        
-        return False, max_similarity
+        print(f"  Pre-computed {len(self._category_texts)} category embeddings")
 
-    def _llama_guard_inference(self, text: str) -> str:
-        """Layer 3: Run LLaMA Guard inference."""
+    def _check_embedding_similarity(self, text: str) -> tuple[bool, float, str, int]:
+        """
+        Check if text is similar to any known unsafe category.
+        
+        Returns: (is_unsafe, max_similarity, matched_category_id, matched_index)
+        """
+        # Encode query (normalized for cosine similarity)
+        query_embedding = self.embedding_model.encode(
+            [text], 
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )[0]
+        
+        # Compute cosine similarities (since both are normalized, dot product = cosine)
+        similarities = np.dot(self._category_embeddings, query_embedding)
+        
+        max_idx = int(np.argmax(similarities))
+        max_similarity = float(similarities[max_idx])
+        matched_category = self._category_ids[max_idx]
+        
+        is_unsafe = max_similarity >= self._embedding_threshold
+        
+        return is_unsafe, max_similarity, matched_category, max_idx
+
+    def _llama_guard_inference(self, text: str) -> tuple[str, int]:
+        """
+        Run LLaMA Guard inference.
+        
+        Returns: (label, tokens_generated)
+        """
         chat = [
             {
                 "role": "user", 
@@ -158,64 +204,99 @@ class LlamaGuardService:
         
         input_ids = self.tokenizer.apply_chat_template(chat, return_tensors="pt").to(self.device)
         
-        output = self.model.generate(
-            input_ids=input_ids,
-            max_new_tokens=10,
-            pad_token_id=0,
-            eos_token_id=self.tokenizer.eos_token_id,
-            stopping_criteria=self.stopping_criteria,
-        )
+        # Use stopping criteria if enabled
+        generate_kwargs = {
+            "input_ids": input_ids,
+            "max_new_tokens": 10,
+            "pad_token_id": 0,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        if self.stopping_criteria:
+            generate_kwargs["stopping_criteria"] = self.stopping_criteria
+        
+        output = self.model.generate(**generate_kwargs)
         
         prompt_len = input_ids.shape[1]
         generated_tokens = output[0][prompt_len:]
-        result = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+        tokens_generated = len(generated_tokens)
         
+        result = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
         first_line = result.split("\n")[0].lower().strip()
         
         if "unsafe" in first_line:
-            return "unsafe"
-        return "safe"
+            return "unsafe", tokens_generated
+        return "safe", tokens_generated
 
     def predict(self, text: str) -> tuple[str, str]:
         """
-        Multi-tier prediction:
-        - Baseline mode: Only LLaMA Guard (no optimization)
-        - Optimized mode: Cache → Embedding → LLaMA Guard
+        Two-layer prediction.
         
-        Returns: (label, layer) where layer is "cache", "embedding", or "llm"
+        Returns: (label, layer) where layer is "embedding" or "llm"
         """
-        
         # ============================================================
-        # Baseline Mode: Skip all optimizations, go directly to LLM
+        # Layer 1: Embedding Fast Path (if enabled)
         # ============================================================
-        if self._optimization_mode == "baseline":
-            label = self._llama_guard_inference(text)
-            return label, "llm"
-        
-        # ============================================================
-        # Optimized Mode: Multi-tier prediction
-        # ============================================================
-        
-        # Layer 1: Check exact match cache
-        cache_key = self._get_cache_key(text)
-        if cache_key in self._cache:
-            return self._cache[cache_key], "cache"
-        
-        # Layer 2: Embedding similarity check
         if self._use_embedding_layer:
-            is_unsafe, similarity = self._check_embedding_similarity(text)
+            is_unsafe, similarity, category, _ = self._check_embedding_similarity(text)
             if is_unsafe:
-                label = "unsafe"
-                if len(self._cache) < self._cache_max_size:
-                    self._cache[cache_key] = label
-                return label, "embedding"
+                return "unsafe", "embedding"
         
-        # Layer 3: LLaMA Guard (final fallback)
-        label = self._llama_guard_inference(text)
-        
-        # Cache the result
-        if len(self._cache) < self._cache_max_size:
-            self._cache[cache_key] = label
-            
+        # ============================================================
+        # Layer 2: LLaMA Guard inference
+        # ============================================================
+        label, _ = self._llama_guard_inference(text)
         return label, "llm"
 
+    def predict_detailed(self, text: str) -> dict:
+        """
+        Detailed prediction with debug information.
+        Useful for analysis and understanding model behavior.
+        
+        Returns dict with:
+        - text: input text
+        - final_label: "safe" or "unsafe"
+        - layer_used: "embedding" or "llm"
+        - embedding_similarity: float (if embedding layer enabled)
+        - matched_category: category ID (if embedding layer enabled)
+        - matched_text: the text that matched (if embedding layer enabled)
+        - tokens_generated: number of tokens generated by LLM (if LLM was used)
+        """
+        result = {
+            "text": text,
+            "final_label": None,
+            "layer_used": None,
+            "embedding_similarity": None,
+            "matched_category": None,
+            "matched_text": None,
+            "tokens_generated": None,
+            "threshold": self._embedding_threshold,
+        }
+        
+        # Layer 1: Embedding
+        if self._use_embedding_layer:
+            is_unsafe, similarity, category, matched_idx = self._check_embedding_similarity(text)
+            result["embedding_similarity"] = similarity
+            result["matched_category"] = category
+            result["matched_text"] = self._category_texts[matched_idx]
+            
+            if is_unsafe:
+                result["final_label"] = "unsafe"
+                result["layer_used"] = "embedding"
+                return result
+        
+        # Layer 2: LLM
+        label, tokens_generated = self._llama_guard_inference(text)
+        result["final_label"] = label
+        result["layer_used"] = "llm"
+        result["tokens_generated"] = tokens_generated
+        
+        return result
+    
+    def get_mode_info(self) -> dict:
+        """Return current mode configuration for reporting."""
+        return {
+            "mode": self._optimization_mode,
+            "stopping_criteria": self._use_stopping_criteria,
+            "embedding_layer": self._use_embedding_layer,
+            "embedding_threshold": self._embedding_threshold if self._use_embedding_layer else None,
+        }
