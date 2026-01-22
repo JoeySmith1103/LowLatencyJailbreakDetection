@@ -21,7 +21,6 @@ class DetectRequest(BaseModel):
 
 class DetectResponse(BaseModel):
     label: str
-    layer: str  # "embedding" or "llm"
 
 
 class DetailedDetectResponse(BaseModel):
@@ -39,15 +38,14 @@ class DetailedDetectResponse(BaseModel):
 @app.post("/v1/detect", response_model=DetectResponse)
 async def detect(request: DetectRequest):
     """
-    Main detection endpoint.
+    Main detection endpoint (follows spec).
     
     Returns:
     - label: "safe" or "unsafe"
-    - layer: "embedding" (fast path) or "llm" (full inference)
     """
     try:
-        label, layer = service.predict(request.text)
-        return DetectResponse(label=label, layer=layer)
+        label, _ = service.predict(request.text)
+        return DetectResponse(label=label)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

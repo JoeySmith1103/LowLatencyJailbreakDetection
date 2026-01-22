@@ -36,7 +36,7 @@ curl -X POST http://localhost:8001/v1/detect \
 ## API Endpoints
 
 ### POST /v1/detect
-主要檢測端點。
+主要檢測端點（符合 spec）。
 
 **Request:**
 ```json
@@ -45,11 +45,11 @@ curl -X POST http://localhost:8001/v1/detect \
 
 **Response:**
 ```json
-{"label": "safe", "layer": "llm"}
+{"label": "safe"}
 ```
 or
 ```json
-{"label": "unsafe", "layer": "embedding"}
+{"label": "unsafe"}
 ```
 
 ### POST /v1/detect/detailed
