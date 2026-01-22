@@ -11,11 +11,10 @@ def download_model():
     print(f"Downloading {model_id}...")
     
     # Get Hugging Face token from environment variables
-    # Support both HF_TOKEN and HUGGING_FACE_HUB_TOKEN
     hf_token = os.getenv("HF_TOKEN")
     if not hf_token:
         raise ValueError(
-            "Hugging Face token not found! Please set HF_TOKEN or HUGGING_FACE_HUB_TOKEN "
+            "Hugging Face token not found! Please set HF_TOKEN"
             "in your environment variables."
         )
     
@@ -24,7 +23,7 @@ def download_model():
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         token=hf_token,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True
     )
     print("Model downloaded successfully.")
