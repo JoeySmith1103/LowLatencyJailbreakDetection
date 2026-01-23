@@ -4,119 +4,34 @@ A latency-optimized safety detection service using `meta-llama/Llama-Guard-3-1B`
 
 ## Problem Statement
 
-在 LLM Guardrail 場景中，使用 LLM 進行安全檢測可以獲得很高的準確率，但會造成顯著的 latency 增加（約 30ms per request）。本專案實作兩種互補的優化策略，在保持準確率的前提下降低 latency。
+在 LLM Guardrail 場景中，使用 LLM 進行安全檢測可以獲得很高的準確率，但會造成顯著的 latency 增加。本專案實作兩種互補的優化策略，在保持準確率的前提下降低 latency。
 
 ---
 ## Quick Start
 
 ```bash
-# Build (model is pre-downloaded during build)
-docker build --build-arg HF_TOKEN=your_hf_token -t lowlatency-jailbreak .
+# 1. 確保 .env 文件包含 HF_TOKEN
+cp .env.example .env
+# 編輯 .env，填入你的 Hugging Face token
 
-# Run with full settings
-docker run --gpus all --env-file .env \
-  -e OPTIMIZATION_MODE=full \
-  -e EMBEDDING_THRESHOLD=0.60 \
-  -p 8001:8001 -d --name jb-server lowlatency-jailbreak
+# 2. Build（自動從 .env 讀取 HF_TOKEN）
+./build.sh
 
-# Test
+# 3. Run service
+docker run --gpus all --env-file .env -p 8001:8001 -d --name jb-server lowlatency-jailbreak
+
+# 4. Test API
 curl -X POST http://localhost:8001/v1/detect \
   -H "Content-Type: application/json" \
   -d '{"text": "How can I hack into a computer?"}'
-```
 
-## Environment Variables
-
-| Variable | Options | Default | Description |
-|----------|---------|---------|-------------|
-| `OPTIMIZATION_MODE` | baseline, stopping, full | full | 優化等級 |
-| `EMBEDDING_THRESHOLD` | 0.0-1.0 | 0.65 | Embedding 判定閾值 |
-
-
-## API Endpoints
-
-### POST /v1/detect
-主要檢測端點（符合 spec）。
-
-**Request:**
-```json
-{"text": "User input string..."}
-```
-
-**Response:**
-```json
-{"label": "safe"}
-```
-or
-```json
-{"label": "unsafe"}
-```
-
-### POST /v1/detect/detailed
-詳細檢測端點（用於分析）。
-
-**Response:**
-```json
-{
-  "text": "...",
-  "label": "unsafe",
-  "layer": "embedding",
-  "embedding_similarity": 0.82,
-  "matched_category": "S2",
-  "matched_text": "hacking into computers...",
-  "threshold": 0.60
-}
-```
-
-## Run Experiments
-
-### Experiment 1: Ablation Study
-
-Compare baseline vs stopping vs embedding vs full modes:
-
-```bash
+# 5. Run experiments
 docker exec jb-server python3 /app/run_ablation_study.py \
   --data /app/LLMSafetyAPIService_data.json \
-  --runs 3
+  --api-url http://localhost:8001
 ```
 
-**Generated Charts:**
-- `ablation_latency.png` - Latency comparison across modes
-- `ablation_tradeoff.png` - Latency vs Accuracy trade-off
-
-### Experiment 2: Threshold Trade-off Analysis
-
-Analyze different embedding thresholds:
-
-```bash
-# Full analysis with case study
-docker exec jb-server python3 /app/analyze_threshold.py \
-  --data /app/LLMSafetyAPIService_data.json \
-  --thresholds 0.50,0.55,0.60,0.65,0.70,0.75,0.80 \
-  --case-study
-```
-
-**Generated Charts:**
-- `analysis_latency_vs_threshold.png` - Threshold vs Latency & Embedding Hit Rate
-- `analysis_precision_recall.png` - Precision vs Recall trade-off
-
-### Copy Charts from Container
-
-```bash
-# Copy all generated charts
-docker cp jb-server:/app/ablation_latency.png .
-docker cp jb-server:/app/ablation_tradeoff.png .
-docker cp jb-server:/app/analysis_latency_vs_threshold.png .
-docker cp jb-server:/app/analysis_precision_recall.png .
-```
-
-## Requirements
-
-- Docker + NVIDIA GPU (CUDA)
-- Hugging Face token for `meta-llama/Llama-Guard-3-1B`
-
-
-## My Approach: Two-Layer Optimization
+## Two-Layer Optimization 
 
 選擇了兩種互補的優化策略：
 
@@ -132,11 +47,12 @@ docker cp jb-server:/app/analysis_precision_recall.png .
 
 **效果**：
 
-
 | Config | Avg Tokens Generated | Latency | Improvement |
 |--------|---------------------|---------|-------------|
-| Baseline (no stopping) | ~8-10 tokens | 31.10 ms | - |
-| With Stopping Criteria | ~1-2 tokens | 16.91 ms | **-46%** |
+| Baseline (no stopping) | 4.46 tokens | 31.88 ms | - |
+| With Stopping Criteria | 2.00 tokens | 17.19 ms | **-46.1%** |
+
+**Token 減少**：55.2%（4.46 → 2.00 tokens）
 
 ### Strategy 2: Embedding-based Fast Path (Architecture Level)
 
@@ -156,32 +72,54 @@ docker cp jb-server:/app/analysis_precision_recall.png .
 
 ---
 
-## Experiments
+## Experiments Analysis
+本實驗硬體設置：
+Intel i7-13700F, NVIDIA RTX 4080 
 
 ### Experiment 1: Ablation Study
 
 ![image](images/ablation_latency.png)
 ![image](images/ablation_tradeoff.png)
 
+#### 主要結果（3次運行平均）
 
-| Configuration | Stopping | Embedding | Avg Latency | vs Baseline | Accuracy |
-|---------------|----------|-----------|-------------|-------------|----------|
-| **baseline** | ❌ | ❌ | 31.27 ms (±1.68) | - | 98.3% |
-| **w/o embedding** | ✅ | ❌ | 16.23 ms (±0.05) | **-48.1%** | 98.0% |
-| **w/o stopping** | ❌ | ✅ | 25.90 ms (±0.31) | -17.2% | 98.7% |
-| **full** | ✅ | ✅ | **15.44 ms (±0.04)** | **-50.6%** | 98.7% |
+| Configuration | Stopping | Embedding | Avg Latency | vs Baseline | Accuracy | Precision | Recall |
+|---------------|----------|-----------|-------------|-------------|----------|-----------|--------|
+| **baseline** | ❌ | ❌ | 31.88 ms (±1.08) | - | 97.3% | 98.6% | 96.0% |
+| **stopping** | ✅ | ❌ | 17.19 ms (±0.05) | **-46.1%** | 98.3% | 99.3% | 97.3% |
+| **embedding** | ❌ | ✅ | 26.67 ms (±0.07) | -16.4% | 98.0% | 99.3% | 96.7% |
+| **full** | ✅ | ✅ | **16.38 ms (±0.02)** | **-48.6%** | **99.0%** | **100.0%** | **98.0%** |
 
-**Token Generation Analysis**：
+#### 延遲分析
 
-| Mode | Avg Tokens Generated | Note |
-|------|---------------------|------|
-| baseline | ~7-10 tokens | 完整生成 "unsafe\nS1\n..." |
-| stopping | ~1-2 tokens | 在 "safe" 或 "unsafe" 處停止 |
+| Configuration | P50 (Median) | P90 | P95 | P99 (Tail) | Max |
+|---------------|--------------|-----|-----|-----------|-----|
+| **baseline** | 28.93 ms | 40.29 ms | 40.48 ms | **95.43 ms** | 203.02 ms |
+| **stopping** | 16.93 ms | 17.86 ms | 18.10 ms | **27.10 ms** | 28.27 ms |
+| **embedding** | 24.63 ms | 42.30 ms | 42.44 ms | **44.23 ms** | 44.47 ms |
+| **full** | 18.83 ms | 19.43 ms | 20.06 ms | **28.28 ms** | 28.58 ms |
 
-> **Insight**: 
-> - **Stopping Criteria** 是最有效的單一優化（-46%），因為它避免了不必要的 token 生成
-> - **Embedding Fast Path** 提供額外的 latency 降低，並允許 Latency vs Accuracy 的 trade-off
-> - 兩者結合效果最佳
+**P99 改善**：從 95.43ms 降至 28.28ms（**-70.4%**）
+
+#### Token Generation Analysis
+
+| Mode | Avg Tokens Generated | Token Reduction | Note |
+|------|---------------------|-----------------|------|
+| baseline | 4.46 tokens | - | 完整生成 "unsafe\nS1\n..." |
+| stopping | 2.00 tokens | **-55.2%** | 在 "safe" 或 "unsafe" 處停止 |
+| embedding | 4.14 tokens | -7.2% | 部分查詢被 embedding 攔截 |
+| full | 2.00 tokens | **-55.2%** | Stopping + Embedding 組合 |
+
+#### Layer Distribution（Full Mode）
+
+- **Embedding Layer**: 17% query
+- **LLM Layer**: 83% query
+
+> **核心發現**: 
+> 1. **Stopping Criteria 貢獻最大**（-46.1% latency, -71.6% P99），因為它避免了不必要的 token 生成
+> 2. **Embedding Fast Path** 為 17% 查詢提供極低延遲（2.7ms），並提供 Latency vs Accuracy 的彈性控制
+> 3. **Full Mode 達到最佳平衡**：-48.6% latency, 99% accuracy, 100% precision, 最穩定（±0.02ms）
+> 4. **P99 大幅改善**：系統穩定性顯著提升（P99/Avg 從 3.0x 降至 1.7x）
 
 ### Experiment 2: Embedding Threshold Trade-off Analysis
 **說明**: 
@@ -192,13 +130,13 @@ Embedding Hit Rate = 被 embedding layer 攔截的 query 數量 / 總 query 數�
 
 | Threshold | Avg Latency | Emb Hit % | Precision | Recall | FP | FN |
 |-----------|-------------|-----------|-----------|--------|----|----|
-| 0.50 | 15.38 ms | 28% | 92.5% | **98%** | 4 | 1 |
-| 0.55 | **14.45 ms** | 23% | **100%** | 92% | **0** | 4 |
-| **0.60** | 15.46 ms | 17% | **100%** | **98%** | **0** | 1 |
-| 0.65 | 16.60 ms | 10% | 96.0% | 96% | 2 | 2 |
-| 0.70 | 16.90 ms | 8% | 100% | 96% | 0 | 2 |
-| 0.75 | 17.30 ms | 6% | 100% | 96% | 0 | 2 |
-| 0.80 | 17.54 ms | 4% | 100% | 96% | 0 | 2 |
+| 0.50 | **14.69 ms** | **28%** | 92.3% | 96% | 4 | 2 |
+| **0.55** |  15.48ms	| 23% | **100%** | 96% | **0** | 2 |
+| 0.60 | 16.42 ms | 17% | **100%** | 94% | **0** | 3 |
+| 0.65 | 17.59 ms | 10% | **100%** | 94% | **0** | 3 |
+| 0.70 | 17.96 ms | 8% | **100%** | **98%** | **0** | **1** |
+| 0.75 | 18.30 ms | 6% | 98% | 96% | 1 | 2 |
+| 0.80 | 18.58 ms | 4% | **100%** | **98%** | **0** | **1** |
 
 #### Trade-off 分析
 ![image](images/analysis_precision_recall.png)
@@ -214,10 +152,10 @@ Embedding Hit Rate = 被 embedding layer 攔截的 query 數量 / 總 query 數�
 - 但有更高的 latency（更多 query 進入 LLM）
 - 適合：**User Experience First** - 避免誤封用戶
 
-**Sweet Spot (0.60)**:
+**Sweet Spot (0.55)**:
 - 在此資料集上達到最佳平衡
 - 100% Precision（零誤判）
-- 98% Recall（僅漏掉 1 個 unsafe query）
+- 96% Recall（僅漏掉 2 個 unsafe query）
 - 相對較低的 latency
 
 ### Experiment 3: Case Study Analysis
@@ -259,21 +197,183 @@ Similarity: 0.315 | Layer: LLM
 
 ## Key Findings
 
-1. **Stopping Criteria** 是最有效的單一優化（-46% latency），且幾乎不影響準確率
-2. **Embedding Fast Path** 提供了 **Latency vs Accuracy 的彈性控制**：
-   - 可根據應用場景選擇不同的 threshold
-   - Security-critical 場景用較低 threshold
-   - User-facing 場景用較高 threshold
+### 1. 兩層優化的結果
 
-3. **Threshold 選擇：
-   > "是否願意用一些誤判（FP）來換取更低的 latency？"
+```
+Baseline: 31.88ms (P99: 95.43ms)
+   ↓ Stopping Criteria (-46.1%)
+Stopping Only: 17.19ms (P99: 27.10ms)
+   ↓ Embedding Fast Path (額外 -4.7%)
+Full Mode: 16.38ms (P99: 28.28ms)
 
-4. **Embedding 的局限性**：
-   - 無法捕捉語義隱晦的攻擊
-   - 對雙關語、隱喻等容易誤判
-   - 使用了general embedding model, 有害text之間的embedding不見得能夠彼此接近
+Total: -48.6% latency, -70.4% P99
+```
 
----
+### 2. Stopping Criteria 貢獻最大
+
+- **Latency**: -46.1%（31.88ms → 17.19ms）
+- **P99**: -71.6%（95.43ms → 27.10ms）
+- **Token Reduction**: -55.2%（4.46 → 2.00 tokens）
+- **Accuracy Impact**: 幾乎沒有（97.3% → 98.3%）
+
+### 3. Full Mode 達到最佳平衡
+
+- **low average latency**：16.38ms
+- **Accuracy**：99.0%
+- **Precision**：100.0%
+- **Recall**：98.0%
+
+### 4. Embedding Threshold 的彈性控制
+
+| Threshold | 用途 | 特點 |
+|-----------|---------|------|
+| **0.55** | 平衡 | 100% precision, 15.48ms |
+| **0.70** | 高安全場景 | 98% recall, 17.96ms |
+| **0.50** | 速度優先 | 最低latency 14.69ms, 但有 4 個 FP |
+
+### 5. Embedding 的局限性
+
+- **語義隱晦攻擊**：難以檢測需要推理的內容
+  - 例："How can I use psychological manipulation techniques..."
+- **雙關語/隱喻**：容易誤判
+  - 例："How do I blow up a balloon?" vs "make an explosive"
+- **General Embedding Model**：有害文本之間的 embedding 不一定接近
+
+
+
+## Project Structure
+```bash
+LowLatencyJailbreakDetection/
+├── src/
+│   ├── main.py                          # API entry point
+│   ├── services/
+│   │   ├── safety_model.py              # Core optimization logic 
+│   │   └── unsafe_examples.py           # Category definitions
+│   └── download_model.py                # Model pre-download
+├── run_ablation_study.py                # Ablation experiment
+├── analyze_threshold.py                 # Threshold analysis
+├── run_experiments.sh                   # Run all experiments
+├── build.sh                             # Auto build script
+├── Dockerfile                           # Docker image
+├── requirements.txt                     # Dependencies
+├── .env.example                         # Config template
+├── LLMSafetyAPIService_data.json        # Test dataset (100 samples)
+└── images/  
+```
+
+### Service
+
+| File | Purpose |
+|------|---------|
+| `src/main.py` | FastAPI application entry point, defines API endpoints |
+| `src/services/safety_model.py` | Core service logic: LLaMA Guard + Stopping Criteria + Embedding Fast Path |
+| `src/services/unsafe_examples.py` | Unsafe category definitions and examples for embedding |
+| `src/download_model.py` | Model pre-download script (runs during Docker build) |
+
+### Experiment Scripts
+
+| File | Purpose |
+|------|---------|
+| `run_ablation_study.py` | Ablation study: compares baseline/stopping/embedding/full modes via HTTP API |
+| `analyze_threshold.py` | Threshold analysis: evaluates embedding threshold trade-offs (latency vs accuracy) |
+| `run_experiments.sh` | One-click script to run all experiments and copy results |
+
+### Docker & Build
+
+| File | Purpose |
+|------|---------|
+| `Dockerfile` | Docker image definition with model pre-download |
+| `build.sh` | Build script that auto-detects sudo and reads HF_TOKEN from .env |
+| `.env.example` | Environment variable template |
+
+### Data & Results
+
+| File/Directory | Purpose |
+|----------------|---------|
+| `LLMSafetyAPIService_data.json` | Test dataset (100 samples: 50 safe, 50 unsafe) |
+| `images/` | Generated experiment charts (ablation_latency.png, etc.) |
+| `requirements.txt` | Python dependencies |
+
+## Environment Variables
+
+| Variable | Options | Default | Description |
+|----------|---------|---------|-------------|
+| `HF_TOKEN` | (required) | - | Hugging Face token |
+| `OPTIMIZATION_MODE` | baseline, stopping, embedding, full | full | optimize strategy |
+| `EMBEDDING_THRESHOLD` | 0.0-1.0 | 0.60 | Embedding consine similarity threshold|
+
+
+
+## API Endpoints
+
+### POST /v1/detect
+主要檢測端點。
+
+**Request:**
+```json
+{"text": "User input string..."}
+```
+
+**Response:**
+```json
+{"label": "safe"}
+```
+or
+```json
+{"label": "unsafe"}
+```
+
+### POST /v1/detect/detailed
+詳細檢測端點（用於實驗分析）。
+
+**Response:**
+```json
+{
+  "text": "...",
+  "label": "unsafe",
+  "layer": "embedding",
+  "embedding_similarity": 0.82,
+  "matched_category": "S2",
+  "matched_text": "hacking into computers...",
+  "threshold": 0.60
+}
+```
+
+### GET /admin/config
+獲取當前配置。
+
+**Response:**
+```json
+{
+  "optimization_mode": "full",
+  "embedding_threshold": 0.60,
+  "use_stopping_criteria": true,
+  "use_embedding_fast_path": true
+}
+```
+
+### POST /admin/config
+動態更新配置（用於實驗）。
+
+**Request:**
+```json
+{
+  "optimization_mode": "baseline",  // baseline, stopping, embedding, full
+  "embedding_threshold": 0.70       // optional
+}
+```
+
+**Response:** 返回更新後的配置
+
+
+
+## Requirements
+
+- Docker
+- Hugging Face token for `meta-llama/Llama-Guard-3-1B`
+
+
+
 
 ## Why Not Cache?
 
@@ -281,7 +381,6 @@ Similarity: 0.315 | Layer: LLM
 
 | 考量 | Cache | Embedding |
 |------|-------|-----------|
-| 技術深度 | 基礎的 key-value 查找 | 語義理解、相似度計算 |
 | 泛化能力 | 只能匹配完全相同的查詢 | 可以識別語義相似的新攻擊 |
 | 實驗說服力 | 需要人為重複資料 | 在 100 筆獨立資料上有意義 |
 | 實際價值 | 適合有大量重複查詢的場景 | 適合多樣化的真實攻擊 |
