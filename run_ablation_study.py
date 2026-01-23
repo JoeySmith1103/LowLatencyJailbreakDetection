@@ -7,21 +7,26 @@ This script runs a complete ablation study comparing:
 3. Embedding Fast Path only
 4. Full (Stopping + Embedding)
 
-It also includes:
-- Token generation analysis (why stopping criteria works)
-- Statistical analysis (mean, std across multiple runs)
-- Visualization
+**IMPORTANT**: This script uses HTTP requests to test the real API performance,
+including network latency and serialization overhead.
 
 Usage:
-    python run_ablation_study.py --data LLMSafetyAPIService_data.json --runs 3
+    # Start service first
+    docker run --gpus all --env-file .env -p 8001:8001 -d --name jb-server lowlatency-jailbreak
+    
+    # Run ablation study
+    docker exec jb-server python3 /app/run_ablation_study.py \
+        --data /app/LLMSafetyAPIService_data.json \
+        --runs 3 \
+        --api-url http://localhost:8001
 """
-import os
 import json
 import time
 import argparse
 import statistics
-from typing import List, Dict, Tuple
-from dataclasses import dataclass, field, asdict
+import requests
+from typing import List, Dict
+from dataclasses import dataclass, field
 from collections import defaultdict
 
 # For visualization
@@ -51,6 +56,34 @@ class SingleRunResult:
     @property
     def std_latency(self) -> float:
         return statistics.stdev(self.latencies) if len(self.latencies) > 1 else 0
+    
+    @property
+    def min_latency(self) -> float:
+        return min(self.latencies) if self.latencies else 0
+    
+    @property
+    def max_latency(self) -> float:
+        return max(self.latencies) if self.latencies else 0
+    
+    @property
+    def p50_latency(self) -> float:
+        """Median latency (50th percentile)."""
+        return statistics.median(self.latencies) if self.latencies else 0
+    
+    @property
+    def p90_latency(self) -> float:
+        """90th percentile latency."""
+        return statistics.quantiles(self.latencies, n=10)[8] if len(self.latencies) >= 10 else self.max_latency
+    
+    @property
+    def p95_latency(self) -> float:
+        """95th percentile latency."""
+        return statistics.quantiles(self.latencies, n=20)[18] if len(self.latencies) >= 20 else self.max_latency
+    
+    @property
+    def p99_latency(self) -> float:
+        """99th percentile latency (tail latency)."""
+        return statistics.quantiles(self.latencies, n=100)[98] if len(self.latencies) >= 100 else self.max_latency
     
     @property
     def avg_tokens(self) -> float:
@@ -111,6 +144,34 @@ class AggregatedResult:
         return statistics.stdev([r.avg_latency for r in self.runs])
     
     @property
+    def p50_latency(self) -> float:
+        """Median latency across all runs."""
+        return statistics.mean([r.p50_latency for r in self.runs])
+    
+    @property
+    def p90_latency(self) -> float:
+        """90th percentile latency across all runs."""
+        return statistics.mean([r.p90_latency for r in self.runs])
+    
+    @property
+    def p95_latency(self) -> float:
+        """95th percentile latency across all runs."""
+        return statistics.mean([r.p95_latency for r in self.runs])
+    
+    @property
+    def p99_latency(self) -> float:
+        """99th percentile (tail) latency across all runs."""
+        return statistics.mean([r.p99_latency for r in self.runs])
+    
+    @property
+    def min_latency(self) -> float:
+        return min([r.min_latency for r in self.runs]) if self.runs else 0
+    
+    @property
+    def max_latency(self) -> float:
+        return max([r.max_latency for r in self.runs]) if self.runs else 0
+    
+    @property
     def avg_tokens(self) -> float:
         valid = [r.avg_tokens for r in self.runs if r.avg_tokens > 0]
         return statistics.mean(valid) if valid else 0
@@ -134,24 +195,36 @@ def load_data(data_path: str) -> List[Dict]:
         return json.load(f)
 
 
-def reset_service():
-    """Reset the singleton service for fresh initialization."""
-    from src.services.safety_model import LlamaGuardService
-    LlamaGuardService._instance = None
+def update_config(api_url: str, mode: str, threshold: float = 0.60) -> bool:
+    """Update service configuration via HTTP API."""
+    try:
+        response = requests.post(
+            f"{api_url}/admin/config",
+            json={
+                "optimization_mode": mode,
+                "embedding_threshold": threshold
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+        config = response.json()
+        print(f"    → Config updated: {config['optimization_mode']}, threshold={config['embedding_threshold']}")
+        return True
+    except Exception as e:
+        print(f"    ✗ Failed to update config: {e}")
+        return False
 
 
-def run_single_evaluation(data: List[Dict], mode: str, threshold: float = 0.60) -> SingleRunResult:
+def run_single_evaluation(data: List[Dict], api_url: str, mode: str, threshold: float = 0.60) -> SingleRunResult:
     """
-    Run a single evaluation with the specified mode.
+    Run a single evaluation with the specified mode via HTTP API.
     """
-    # Set environment variables
-    os.environ["OPTIMIZATION_MODE"] = mode
-    os.environ["EMBEDDING_THRESHOLD"] = str(threshold)
+    # Update service configuration
+    if not update_config(api_url, mode, threshold):
+        raise RuntimeError(f"Failed to configure service for mode: {mode}")
     
-    # Reset and reinitialize service
-    reset_service()
-    from src.services.safety_model import LlamaGuardService
-    service = LlamaGuardService()
+    # Wait for service to stabilize
+    time.sleep(2)
     
     result = SingleRunResult(mode=mode)
     
@@ -159,23 +232,35 @@ def run_single_evaluation(data: List[Dict], mode: str, threshold: float = 0.60) 
         text = item['text']
         ground_truth = item['label']
         
+        # Measure latency including HTTP overhead
         start_time = time.time()
-        detailed = service.predict_detailed(text)
-        latency_ms = (time.time() - start_time) * 1000
-        
-        result.latencies.append(latency_ms)
-        result.predictions.append(detailed['final_label'])
-        result.ground_truths.append(ground_truth)
-        result.layers.append(detailed['layer_used'])
-        result.tokens_generated.append(detailed.get('tokens_generated'))
+        try:
+            response = requests.post(
+                f"{api_url}/v1/detect/detailed",
+                json={"text": text},
+                timeout=30
+            )
+            response.raise_for_status()
+            detailed = response.json()
+            latency_ms = (time.time() - start_time) * 1000
+            
+            result.latencies.append(latency_ms)
+            result.predictions.append(detailed['label'])
+            result.ground_truths.append(ground_truth)
+            result.layers.append(detailed['layer'])
+            result.tokens_generated.append(detailed.get('tokens_generated'))
+        except Exception as e:
+            print(f"    -Error processing query: {e}")
+            # Skip this sample
+            continue
     
     return result
 
 
-def run_ablation_study(data: List[Dict], modes: List[str], num_runs: int = 3, 
+def run_ablation_study(data: List[Dict], api_url: str, modes: List[str], num_runs: int = 3, 
                        threshold: float = 0.60, verbose: bool = True) -> Dict[str, AggregatedResult]:
     """
-    Run complete ablation study across all modes.
+    Run complete ablation study across all modes via HTTP API.
     """
     results = {}
     
@@ -191,7 +276,7 @@ def run_ablation_study(data: List[Dict], modes: List[str], num_runs: int = 3,
             if verbose:
                 print(f"  Run {run_idx + 1}/{num_runs}...", end=" ")
             
-            run_result = run_single_evaluation(data, mode, threshold)
+            run_result = run_single_evaluation(data, api_url, mode, threshold)
             aggregated.runs.append(run_result)
             
             if verbose:
@@ -208,7 +293,7 @@ def run_ablation_study(data: List[Dict], modes: List[str], num_runs: int = 3,
 def print_ablation_results(results: Dict[str, AggregatedResult], baseline_mode: str = "baseline"):
     """Print comprehensive ablation study results."""
     print("\n" + "=" * 90)
-    print("ABLATION STUDY RESULTS")
+    print("ABLATION STUDY RESULTS (via HTTP API)")
     print("=" * 90)
     
     baseline = results.get(baseline_mode)
@@ -232,6 +317,25 @@ def print_ablation_results(results: Dict[str, AggregatedResult], baseline_mode: 
               f"{metrics['accuracy']*100:<12.1f} {metrics['precision']*100:<12.1f} {metrics['recall']*100:<10.1f}")
     
     print("-" * 90)
+    
+    # Latency percentile breakdown
+    print("\n" + "=" * 90)
+    print("LATENCY PERCENTILE BREAKDOWN (ms)")
+    print("=" * 90)
+    print(f"\n{'Mode':<20} {'Min':<10} {'P50':<10} {'P90':<10} {'P95':<10} {'P99':<10} {'Max':<10}")
+    print("-" * 90)
+    
+    for mode, result in results.items():
+        print(f"{mode:<20} {result.min_latency:<10.2f} {result.p50_latency:<10.2f} "
+              f"{result.p90_latency:<10.2f} {result.p95_latency:<10.2f} "
+              f"{result.p99_latency:<10.2f} {result.max_latency:<10.2f}")
+    
+    print("-" * 90)
+    print("\nKey Insights:")
+    print("   • P50 (median): Typical user experience")
+    print("   • P90/P95: Most users' experience")
+    print("   • P99 (tail latency): Worst-case scenario - critical for SLA")
+    print("   • Lower P99 = More consistent performance")
 
 
 def print_token_analysis(results: Dict[str, AggregatedResult]):
@@ -268,7 +372,7 @@ def print_token_analysis(results: Dict[str, AggregatedResult]):
     
     if baseline_tokens > 0 and stopping_tokens > 0:
         reduction = (baseline_tokens - stopping_tokens) / baseline_tokens * 100
-        print(f"\n→ Token reduction with stopping criteria: {reduction:.1f}%")
+        print(f"\nToken reduction with stopping criteria: {reduction:.1f}%")
         print(f"  ({baseline_tokens:.1f} tokens → {stopping_tokens:.1f} tokens)")
 
 
@@ -319,7 +423,7 @@ def plot_ablation_results(results: Dict[str, AggregatedResult], output_dir: str 
                   color=colors[:len(modes)], edgecolor='black', linewidth=1)
     
     ax.set_ylabel('Average Latency (ms)', fontsize=12, fontweight='bold')
-    ax.set_title('Ablation Study: Latency Comparison', fontsize=14, fontweight='bold')
+    ax.set_title('Ablation Study: API Latency Comparison (HTTP)', fontsize=14, fontweight='bold')
     ax.set_xlabel('Optimization Configuration', fontsize=12)
     
     # Add value labels
@@ -367,7 +471,7 @@ def plot_ablation_results(results: Dict[str, AggregatedResult], output_dir: str 
     ax1.set_xticks(x)
     ax1.set_xticklabels(modes)
     ax1.set_xlabel('Optimization Configuration', fontsize=12)
-    ax1.set_title('Ablation Study: Latency vs Accuracy', fontsize=14, fontweight='bold')
+    ax1.set_title('Ablation Study: API Latency vs Accuracy', fontsize=14, fontweight='bold')
     
     # Combined legend
     lines1, labels1 = ax1.get_legend_handles_labels()
@@ -378,36 +482,48 @@ def plot_ablation_results(results: Dict[str, AggregatedResult], output_dir: str 
     plt.savefig(f'{output_dir}/ablation_tradeoff.png', dpi=150)
     print(f"Saved: {output_dir}/ablation_tradeoff.png")
     plt.close()
-    
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Ablation Study")
+    parser = argparse.ArgumentParser(description="Run Ablation Study via HTTP API")
     parser.add_argument("--data", default="LLMSafetyAPIService_data.json", help="Path to test data")
     parser.add_argument("--runs", type=int, default=3, help="Number of runs per mode")
     parser.add_argument("--threshold", type=float, default=0.60, help="Embedding threshold for modes with embedding")
     parser.add_argument("--output-dir", default=".", help="Output directory for plots")
     parser.add_argument("--modes", type=str, default="baseline,stopping,embedding,full",
                         help="Comma-separated modes to test")
+    parser.add_argument("--api-url", default="http://localhost:8001", help="API base URL")
     args = parser.parse_args()
     
     modes = [m.strip() for m in args.modes.split(",")]
     
     print("=" * 70)
-    print("ABLATION STUDY: LOW-LATENCY JAILBREAK DETECTION")
+    print("ABLATION STUDY: LOW-LATENCY JAILBREAK DETECTION (HTTP API)")
     print("=" * 70)
+    print(f"API URL: {args.api_url}")
     print(f"Data: {args.data}")
     print(f"Modes: {modes}")
     print(f"Runs per mode: {args.runs}")
     print(f"Embedding threshold: {args.threshold}")
     print("=" * 70)
     
+    # Check API health
+    try:
+        response = requests.get(f"{args.api_url}/health", timeout=5)
+        response.raise_for_status()
+        print(f"✓ API is healthy: {response.json()}")
+    except Exception as e:
+        print(f"✗ Failed to connect to API: {e}")
+        print("  Make sure the service is running with:")
+        print("  docker run --gpus all --env-file .env -p 8001:8001 -d --name jb-server lowlatency-jailbreak")
+        return
+    
     # Load data
     data = load_data(args.data)
     print(f"Loaded {len(data)} test samples")
     
     # Run ablation study
-    results = run_ablation_study(data, modes, num_runs=args.runs, 
+    results = run_ablation_study(data, args.api_url, modes, num_runs=args.runs, 
                                   threshold=args.threshold, verbose=True)
     
     # Print results
@@ -443,7 +559,9 @@ def main():
         improvement = (baseline_lat - full_lat) / baseline_lat * 100
         print(f"3. Full (Stopping + Embedding): -{improvement:.1f}% latency")
     
-    print("\n✅ Ablation study complete!")
+    print("\nAblation study complete!")
+    print("\nNote: Latency includes HTTP request/response overhead.")
+    print("      This represents real-world API performance.")
 
 
 if __name__ == "__main__":

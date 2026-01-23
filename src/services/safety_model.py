@@ -47,7 +47,7 @@ class LlamaGuardService:
     - baseline: Pure LLaMA Guard, no optimizations
     - stopping: LLaMA Guard with custom stopping criteria only
     - embedding: Embedding fast path only
-    - full: Stopping + Embedding (recommended)
+    - full: Stopping + Embedding 
     
     Trade-off Control (via EMBEDDING_THRESHOLD env var):
     - Lower threshold (e.g., 0.50): More aggressive blocking, lower latency, but may have false positives
@@ -72,7 +72,7 @@ class LlamaGuardService:
         # - baseline: Pure LLaMA Guard, no optimizations
         # - stopping: LLaMA Guard with stopping criteria only
         # - embedding: Embedding fast path only (no stopping criteria)
-        # - full: Stopping + Embedding (recommended)
+        # - full: Stopping + Embedding
         # ============================================================
         self._optimization_mode = os.getenv("OPTIMIZATION_MODE", "full").lower()
         valid_modes = ["baseline", "stopping", "embedding", "full"]
@@ -144,12 +144,7 @@ class LlamaGuardService:
     
     def _load_embedding_model(self):
         """
-        Load embedding model and pre-compute category embeddings.
-        
-        Model Choice: all-MiniLM-L6-v2
-        - Lightweight: 384 dimensions, 22M parameters
-        - Fast: ~2.8ms per query on GPU
-        - Good quality: Trained on 1B sentence pairs
+        Load embedding model (all-MiniLM-L6-v2) and pre-compute category embeddings.
         """
         self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         
@@ -295,8 +290,12 @@ class LlamaGuardService:
     def get_mode_info(self) -> dict:
         """Return current mode configuration for reporting."""
         return {
-            "mode": self._optimization_mode,
-            "stopping_criteria": self._use_stopping_criteria,
-            "embedding_layer": self._use_embedding_layer,
-            "embedding_threshold": self._embedding_threshold if self._use_embedding_layer else None,
+            "optimization_mode": self._optimization_mode,
+            "use_stopping_criteria": self._use_stopping_criteria,
+            "use_embedding_fast_path": self._use_embedding_layer,
+            "embedding_threshold": self._embedding_threshold if self._use_embedding_layer else 0.0,
         }
+
+
+def reset_service():
+    LlamaGuardService._instance = None

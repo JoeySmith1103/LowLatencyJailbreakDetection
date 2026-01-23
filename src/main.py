@@ -3,7 +3,8 @@ from pydantic import BaseModel
 from typing import Optional
 from pathlib import Path
 from dotenv import load_dotenv
-from src.services.safety_model import LlamaGuardService
+import os
+from src.services.safety_model import LlamaGuardService, reset_service
 
 # Load environment variables from .env file
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +34,20 @@ class DetailedDetectResponse(BaseModel):
     matched_text: Optional[str] = None
     tokens_generated: Optional[int] = None
     threshold: Optional[float] = None
+
+
+class ConfigRequest(BaseModel):
+    """Configuration update request."""
+    optimization_mode: Optional[str] = None  # baseline, stopping, embedding, full
+    embedding_threshold: Optional[float] = None  # 0.0-1.0
+
+
+class ConfigResponse(BaseModel):
+    """Current configuration."""
+    optimization_mode: str
+    embedding_threshold: float
+    use_stopping_criteria: bool
+    use_embedding_fast_path: bool
 
 
 @app.post("/v1/detect", response_model=DetectResponse)
@@ -80,3 +95,41 @@ def health_check():
         "status": "ok",
         "mode_info": service.get_mode_info()
     }
+
+
+@app.get("/admin/config", response_model=ConfigResponse)
+def get_config():
+    """Get current configuration."""
+    mode_info = service.get_mode_info()
+    return ConfigResponse(
+        optimization_mode=mode_info["optimization_mode"],
+        embedding_threshold=mode_info["embedding_threshold"],
+        use_stopping_criteria=mode_info["use_stopping_criteria"],
+        use_embedding_fast_path=mode_info["use_embedding_fast_path"]
+    )
+
+
+@app.post("/admin/config", response_model=ConfigResponse)
+def update_config(config: ConfigRequest):
+    """
+    Update service configuration and reinitialize.
+    
+    This allows experiments to dynamically change optimization settings.
+    """
+    global service
+    
+    try:
+        # Update environment variables
+        if config.optimization_mode:
+            os.environ["OPTIMIZATION_MODE"] = config.optimization_mode
+        if config.embedding_threshold is not None:
+            os.environ["EMBEDDING_THRESHOLD"] = str(config.embedding_threshold)
+        
+        # Reset and reinitialize service
+        reset_service()
+        service = LlamaGuardService()
+        
+        # Return new configuration
+        return get_config()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update config: {str(e)}")

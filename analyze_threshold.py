@@ -12,13 +12,21 @@ The core insight:
 - This is fundamentally a Latency vs Accuracy trade-off
 
 Usage:
-    python analyze_threshold.py --url http://localhost:8001 --data LLMSafetyAPIService_data.json
+    # Start service first
+    docker run --gpus all --env-file .env -p 8001:8001 -d --name jb-server lowlatency-jailbreak
+    
+    # Run threshold analysis
+    docker exec jb-server python3 /app/analyze_threshold.py \
+        --data /app/LLMSafetyAPIService_data.json \
+        --api-url http://localhost:8001 \
+        --case-study
 """
 import json
 import time
 import argparse
 import statistics
-from typing import List, Dict, Tuple
+import requests
+from typing import List, Dict
 from dataclasses import dataclass, field
 
 # For visualization
@@ -114,6 +122,30 @@ class ThresholdAnalysis:
         return statistics.mean(latencies) if latencies else 0
     
     @property
+    def p50_latency(self) -> float:
+        """Median latency (50th percentile)."""
+        latencies = [r.latency_ms for r in self.results]
+        return statistics.median(latencies) if latencies else 0
+    
+    @property
+    def p90_latency(self) -> float:
+        """90th percentile latency."""
+        latencies = [r.latency_ms for r in self.results]
+        return statistics.quantiles(latencies, n=10)[8] if len(latencies) >= 10 else max(latencies) if latencies else 0
+    
+    @property
+    def p95_latency(self) -> float:
+        """95th percentile latency."""
+        latencies = [r.latency_ms for r in self.results]
+        return statistics.quantiles(latencies, n=20)[18] if len(latencies) >= 20 else max(latencies) if latencies else 0
+    
+    @property
+    def p99_latency(self) -> float:
+        """99th percentile (tail) latency."""
+        latencies = [r.latency_ms for r in self.results]
+        return statistics.quantiles(latencies, n=100)[98] if len(latencies) >= 100 else max(latencies) if latencies else 0
+    
+    @property
     def embedding_hit_rate(self) -> float:
         embedding_hits = sum(1 for r in self.results if r.layer_used == "embedding")
         return embedding_hits / self.total if self.total > 0 else 0
@@ -133,20 +165,37 @@ def load_data(data_path: str) -> List[Dict]:
         return json.load(f)
 
 
-def run_analysis_local(data: List[Dict], threshold: float) -> ThresholdAnalysis:
+def update_config(api_url: str, threshold: float) -> bool:
+    """Update service configuration via HTTP API."""
+    try:
+        response = requests.post(
+            f"{api_url}/admin/config",
+            json={
+                "optimization_mode": "full",
+                "embedding_threshold": threshold
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+        config = response.json()
+        print(f"  → Config updated: threshold={config['embedding_threshold']}")
+        return True
+    except Exception as e:
+        print(f"  ✗ Failed to update config: {e}")
+        return False
+
+
+def run_analysis_http(data: List[Dict], api_url: str, threshold: float) -> ThresholdAnalysis:
     """
-    Run analysis locally (without API) for faster iteration.
-    This simulates different thresholds without restarting the server.
+    Run analysis via HTTP API for real-world performance.
     """
-    import os
-    os.environ["OPTIMIZATION_MODE"] = "full"
-    os.environ["EMBEDDING_THRESHOLD"] = str(threshold)
+    # Update configuration
+    if not update_config(api_url, threshold):
+        raise RuntimeError(f"Failed to configure service for threshold: {threshold}")
     
-    # Reset singleton for fresh initialization
-    from src.services.safety_model import LlamaGuardService
-    LlamaGuardService._instance = None
+    # Wait for service to stabilize
+    time.sleep(2)
     
-    service = LlamaGuardService()
     analysis = ThresholdAnalysis(threshold=threshold)
     
     print(f"\nRunning analysis with threshold={threshold}...")
@@ -155,22 +204,33 @@ def run_analysis_local(data: List[Dict], threshold: float) -> ThresholdAnalysis:
         text = item['text']
         ground_truth = item['label']
         
+        # Measure latency including HTTP overhead
         start_time = time.time()
-        detailed = service.predict_detailed(text)
-        latency_ms = (time.time() - start_time) * 1000
-        
-        result = PredictionResult(
-            text=text,
-            ground_truth=ground_truth,
-            predicted_label=detailed['final_label'],
-            layer_used=detailed['layer_used'],
-            embedding_similarity=detailed.get('embedding_similarity'),
-            matched_category=detailed.get('matched_category'),
-            matched_text=detailed.get('matched_text'),
-            tokens_generated=detailed.get('tokens_generated'),
-            latency_ms=latency_ms,
-        )
-        analysis.results.append(result)
+        try:
+            response = requests.post(
+                f"{api_url}/v1/detect/detailed",
+                json={"text": text},
+                timeout=30
+            )
+            response.raise_for_status()
+            detailed = response.json()
+            latency_ms = (time.time() - start_time) * 1000
+            
+            result = PredictionResult(
+                text=text,
+                ground_truth=ground_truth,
+                predicted_label=detailed['label'],
+                layer_used=detailed['layer'],
+                embedding_similarity=detailed.get('embedding_similarity'),
+                matched_category=detailed.get('matched_category'),
+                matched_text=detailed.get('matched_text'),
+                tokens_generated=detailed.get('tokens_generated'),
+                latency_ms=latency_ms,
+            )
+            analysis.results.append(result)
+        except Exception as e:
+            print(f"  ✗ Error processing query: {e}")
+            continue
         
         # Progress
         if (i + 1) % 20 == 0:
@@ -219,7 +279,8 @@ def print_case_study(analysis: ThresholdAnalysis, top_n: int = 5):
     for r in tp_embedding[:top_n]:
         print(f"\n   Query: \"{r.text[:60]}...\"" if len(r.text) > 60 else f"\n   Query: \"{r.text}\"")
         print(f"   Similarity: {r.embedding_similarity:.3f} | Matched: {r.matched_category}")
-        print(f"   Matched Text: \"{r.matched_text[:50]}...\"" if len(r.matched_text) > 50 else f"   Matched Text: \"{r.matched_text}\"")
+        if r.matched_text:
+            print(f"   Matched Text: \"{r.matched_text[:50]}...\"" if len(r.matched_text) > 50 else f"   Matched Text: \"{r.matched_text}\"")
     
     # False Positives via Embedding (Problem cases)
     fp_embedding = [r for r in analysis.embedding_hits if r.is_false_positive]
@@ -228,7 +289,8 @@ def print_case_study(analysis: ThresholdAnalysis, top_n: int = 5):
     for r in fp_embedding[:top_n]:
         print(f"\n   Query: \"{r.text[:60]}...\"" if len(r.text) > 60 else f"\n   Query: \"{r.text}\"")
         print(f"   Similarity: {r.embedding_similarity:.3f} | Matched: {r.matched_category}")
-        print(f"   Matched Text: \"{r.matched_text[:50]}...\"" if len(r.matched_text) > 50 else f"   Matched Text: \"{r.matched_text}\"")
+        if r.matched_text:
+            print(f"   Matched Text: \"{r.matched_text[:50]}...\"" if len(r.matched_text) > 50 else f"   Matched Text: \"{r.matched_text}\"")
     
     # False Negatives (Dangerous cases)
     fn_cases = [r for r in analysis.results if r.is_false_negative]
@@ -236,7 +298,10 @@ def print_case_study(analysis: ThresholdAnalysis, top_n: int = 5):
     print("   (Unsafe content that was NOT detected - DANGEROUS)")
     for r in fn_cases[:top_n]:
         print(f"\n   Query: \"{r.text[:60]}...\"" if len(r.text) > 60 else f"\n   Query: \"{r.text}\"")
-        print(f"   Similarity: {r.embedding_similarity:.3f} | Layer: {r.layer_used}")
+        if r.embedding_similarity:
+            print(f"   Similarity: {r.embedding_similarity:.3f} | Layer: {r.layer_used}")
+        else:
+            print(f"   Layer: {r.layer_used}")
     
     # Interesting: High similarity but safe (near misses)
     safe_high_sim = [r for r in analysis.results 
@@ -256,7 +321,7 @@ def print_case_study(analysis: ThresholdAnalysis, top_n: int = 5):
 def compare_thresholds(analyses: List[ThresholdAnalysis]):
     """Print comparison table across thresholds."""
     print("\n" + "=" * 90)
-    print("THRESHOLD COMPARISON")
+    print("THRESHOLD COMPARISON (via HTTP API)")
     print("=" * 90)
     
     print(f"\n{'Threshold':<12} {'Latency':<12} {'Emb Hit %':<12} {'Precision':<12} {'Recall':<12} {'F1':<12} {'FP':<6} {'FN':<6}")
@@ -269,16 +334,32 @@ def compare_thresholds(analyses: List[ThresholdAnalysis]):
     
     print("-" * 90)
     
+    # Latency percentile breakdown
+    print("\n" + "=" * 90)
+    print("LATENCY PERCENTILE BREAKDOWN (ms)")
+    print("=" * 90)
+    print(f"\n{'Threshold':<12} {'P50':<12} {'P90':<12} {'P95':<12} {'P99':<12}")
+    print("-" * 90)
+    
+    for a in analyses:
+        print(f"{a.threshold:<12.2f} {a.p50_latency:<12.2f} {a.p90_latency:<12.2f} "
+              f"{a.p95_latency:<12.2f} {a.p99_latency:<12.2f}")
+    
+    print("-" * 90)
+    print("\n💡 P99 (tail latency) is critical for SLA - represents worst-case user experience")
+    
     # Find best for each metric
     best_latency = min(analyses, key=lambda x: x.avg_latency)
+    best_p99 = min(analyses, key=lambda x: x.p99_latency)
     best_precision = max(analyses, key=lambda x: x.precision)
     best_recall = max(analyses, key=lambda x: x.recall)
     best_f1 = max(analyses, key=lambda x: x.f1)
     
-    print(f"\nBest Latency:   threshold={best_latency.threshold} ({best_latency.avg_latency:.2f}ms)")
-    print(f"Best Precision: threshold={best_precision.threshold} ({best_precision.precision*100:.1f}%)")
-    print(f"Best Recall:    threshold={best_recall.threshold} ({best_recall.recall*100:.1f}%)")
-    print(f"Best F1:        threshold={best_f1.threshold} ({best_f1.f1*100:.1f}%)")
+    print(f"\nBest Avg Latency: threshold={best_latency.threshold} ({best_latency.avg_latency:.2f}ms)")
+    print(f"Best P99 Latency: threshold={best_p99.threshold} ({best_p99.p99_latency:.2f}ms)")
+    print(f"Best Precision:   threshold={best_precision.threshold} ({best_precision.precision*100:.1f}%)")
+    print(f"Best Recall:      threshold={best_recall.threshold} ({best_recall.recall*100:.1f}%)")
+    print(f"Best F1:          threshold={best_f1.threshold} ({best_f1.f1*100:.1f}%)")
 
 
 def plot_threshold_tradeoff(analyses: List[ThresholdAnalysis], output_dir: str = "."):
@@ -309,13 +390,13 @@ def plot_threshold_tradeoff(analyses: List[ThresholdAnalysis], output_dir: str =
     ax2.tick_params(axis='y', labelcolor=color)
     
     # Add annotations
-    ax1.axvline(x=0.65, color='green', linestyle=':', alpha=0.7, label='Recommended (0.65)')
+    ax1.axvline(x=0.60, color='green', linestyle=':', alpha=0.7, label='Recommended (0.60)')
     
     lines = line1 + line2
     labels = [l.get_label() for l in lines]
     ax1.legend(lines, labels, loc='upper right')
     
-    plt.title('Threshold vs Latency & Embedding Hit Rate', fontsize=14, fontweight='bold')
+    plt.title('Threshold vs API Latency & Embedding Hit Rate', fontsize=14, fontweight='bold')
     fig.tight_layout()
     plt.savefig(f'{output_dir}/analysis_latency_vs_threshold.png', dpi=150)
     print(f"Saved: {output_dir}/analysis_latency_vs_threshold.png")
@@ -344,23 +425,36 @@ def plot_threshold_tradeoff(analyses: List[ThresholdAnalysis], output_dir: str =
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze Embedding Threshold Trade-offs")
+    parser = argparse.ArgumentParser(description="Analyze Embedding Threshold Trade-offs via HTTP API")
     parser.add_argument("--data", default="LLMSafetyAPIService_data.json", help="Path to test data")
     parser.add_argument("--thresholds", type=str, default="0.50,0.55,0.60,0.65,0.70,0.75,0.80",
                         help="Comma-separated thresholds to test")
     parser.add_argument("--output-dir", default=".", help="Output directory for plots")
     parser.add_argument("--case-study", action="store_true", help="Print detailed case study")
+    parser.add_argument("--api-url", default="http://localhost:8001", help="API base URL")
     args = parser.parse_args()
     
     # Parse thresholds
     thresholds = [float(t.strip()) for t in args.thresholds.split(",")]
     
     print("=" * 70)
-    print("EMBEDDING THRESHOLD ANALYSIS")
+    print("EMBEDDING THRESHOLD ANALYSIS (HTTP API)")
     print("=" * 70)
+    print(f"API URL: {args.api_url}")
     print(f"Data: {args.data}")
     print(f"Thresholds: {thresholds}")
     print("=" * 70)
+    
+    # Check API health
+    try:
+        response = requests.get(f"{args.api_url}/health", timeout=5)
+        response.raise_for_status()
+        print(f"✓ API is healthy: {response.json()}")
+    except Exception as e:
+        print(f"✗ Failed to connect to API: {e}")
+        print("  Make sure the service is running with:")
+        print("  docker run --gpus all --env-file .env -p 8001:8001 -d --name jb-server lowlatency-jailbreak")
+        return
     
     # Load data
     data = load_data(args.data)
@@ -369,7 +463,7 @@ def main():
     # Run analysis for each threshold
     analyses = []
     for threshold in thresholds:
-        analysis = run_analysis_local(data, threshold)
+        analysis = run_analysis_http(data, args.api_url, threshold)
         analyses.append(analysis)
         print_analysis_summary(analysis)
         
@@ -384,6 +478,8 @@ def main():
         plot_threshold_tradeoff(analyses, args.output_dir)
     
     print("\n✅ Analysis complete!")
+    print("\nNote: Latency includes HTTP request/response overhead.")
+    print("      This represents real-world API performance.")
 
 
 if __name__ == "__main__":
